@@ -1,8 +1,6 @@
 name: Add Stata license
 on:
   push:
-    paths:
-      - 'README.md'
   workflow_dispatch:
     inputs:
       stata_version:
