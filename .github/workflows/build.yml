@@ -1,0 +1,572 @@
+name: Run submission
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches:
+      - main
+
+jobs:
+################################################################################
+# Find Submitted Code and Stata Version
+################################################################################
+  initialize:
+    if: github.actor != 'github-classroom[bot]' && github.actor != 'dependabot[bot]' && github.actor != 'dependabot-preview[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3 # Github's default timeout is 6hr, the maximum configurable timeout is 72hr
+    outputs:
+      SUBMITTED_CODE: ${{ steps.submitted_code.outputs.SUBMITTED_CODE }}
+      STATA_VERSION: ${{ steps.stata_version.outputs.STATA_VERSION }}
+
+    steps:
+      - name: Check out code repository
+        uses: actions/checkout@v4
+
+      - name: Install pandoc
+        run: |
+          # See latest versions here: https://github.com/jgm/pandoc/releases/
+          wget --progress=dot:mega -O pandoc.deb "https://github.com/jgm/pandoc/releases/download/3.4/pandoc-3.4-1-amd64.deb"
+          sudo dpkg --install pandoc.deb
+          rm pandoc.deb
+
+      - name: Find submitted code
+        id: submitted_code
+        run: |
+          if python automation/submission_find.py > submitted_code.log; then
+            echo "SUBMITTED_CODE=$(cat submitted_code.log)" >> $GITHUB_OUTPUT
+            echo "✅ Found submitted code: $(jq -r '.original' submitted_code.log)"
+            exit 0
+          else
+            pandoc -f html -t plain submitted_code.log
+            cat submitted_code.log >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
+      - name: Verify Stata license is available if submitted Stata code
+        id: stata_config
+        run: |
+          if [ ! -f stata.lic.encrypted ]; then
+            message="<h1>❌ Configuration Error</h1> Stata license not found. When submitting Stata code, you must run the <code>stata_license</code> Github Action to install your license in this repository."
+            echo "$message" >> $GITHUB_STEP_SUMMARY
+            echo "$message" | pandoc -f html -t plain
+            exit 1
+          else
+            echo "✅ Stata license found."
+          fi
+        if: fromJson(steps.submitted_code.outputs.SUBMITTED_CODE).stata == true
+
+      - name: Output Stata version
+        id: stata_version
+        run: |
+          echo "STATA_VERSION=$(yq eval '.stata_version' automation/config.yaml)" >> $GITHUB_OUTPUT
+
+################################################################################
+# Run Submission
+################################################################################
+  run_submission:
+    needs: initialize
+    runs-on: ubuntu-latest
+    timeout-minutes: 15 # Github's default timeout is 6hr, the maximum configurable timeout is 72hr
+    outputs:
+      PAPER_PATH: ${{ steps.config.outputs.PAPER_PATH }}
+      TIMESTAMP: ${{ steps.config.outputs.TIMESTAMP }}
+      LOG_HASH: ${{ steps.hash.outputs.LOG_HASH }}
+
+    steps:
+      #######################
+      # Configure
+      #######################
+
+      - name: Check out code repository
+        uses: actions/checkout@v4
+
+      - name: Store configuration variables
+        id: config
+        run: |
+          echo "DVC_FILES=$(find data/raw -type f -name "*.dvc" 2>/dev/null | wc -l)" >> $GITHUB_OUTPUT
+          echo "RESULTS_GHS_NAME=$(yq '.results_correct_ghs' automation/config.yaml)" >> $GITHUB_OUTPUT
+          echo "RESULTS_SUBMITTED_PATH=$(yq '.results_submitted_path' automation/config.yaml)" >> $GITHUB_OUTPUT
+          echo "PAPER_PATH=$(yq '.paper_typeset' automation/config.yaml)" >> $GITHUB_OUTPUT
+          echo "TIMESTAMP=$(TZ='America/Toronto' date '+%Y_%m_%d_%Hh%Mm%Ss')" >> $GITHUB_OUTPUT
+
+      - name: Install pandoc
+        run: |
+          # See latest versions here: https://github.com/jgm/pandoc/releases/
+          wget --progress=dot:mega -O pandoc.deb "https://github.com/jgm/pandoc/releases/download/3.4/pandoc-3.4-1-amd64.deb"
+          sudo dpkg --install pandoc.deb
+          rm pandoc.deb
+
+      #######################
+      # Configure Stata
+      #######################
+
+      - name: Install Stata dependencies from apt
+        run: |
+          # Install ncurses5 from Ubuntu 22.04 apt repository: still a Stata dependency but no longer available in the 24.04 apt repository
+          echo "deb http://archive.ubuntu.com/ubuntu jammy main universe" | sudo tee /etc/apt/sources.list.d/jammy.list
+          sudo apt-get update
+          DEBIAN_FRONTEND=noninteractive sudo apt-get install --yes --no-install-recommends libncurses5 libtinfo5 age
+          sudo rm /etc/apt/sources.list.d/jammy.list
+        if: fromJson(needs.initialize.outputs.SUBMITTED_CODE).stata == true
+
+      - name: Install Stata, license and packages
+        run: |
+          ./automation/stata_install.py --install-source=decrypt --license-source=decrypt --version=${STATA_VERSION} --add requirements
+        env:
+          STATA_AGE_PRIVATE_KEY: ${{ secrets.STATA_AGE_PRIVATE_KEY }}
+          STATA_VERSION: ${{ needs.initialize.outputs.STATA_VERSION }}
+        if: fromJson(needs.initialize.outputs.SUBMITTED_CODE).stata == true
+
+      #######################
+      # Configure Python
+      #######################
+
+      - name: Install Python dependencies
+        run: python -m pip install -r packages-python.txt
+        if: fromJson(needs.initialize.outputs.SUBMITTED_CODE).python == true
+
+      #######################
+      # Configure R
+      #######################
+
+      - name: Install R dependencies
+        run: ./automation/r_install_dependencies.sh -r packages-r.txt
+        if: fromJson(needs.initialize.outputs.SUBMITTED_CODE).r == true
+
+      #######################
+      # Load Data
+      #######################
+
+      - name: Pull raw data from DVC remote storage
+        run: dvc pull
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.DVC_READONLY_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.DVC_READONLY_AWS_SECRET_ACCESS_KEY }}
+        if: steps.config.outputs.DVC_FILES != '0'
+
+      #######################
+      # Build
+      #######################
+
+      - name: Create directories for derived files
+        run: |
+          rm -rf data/derived/
+          rm -rf results/
+          mkdir -p data/derived
+          mkdir -p results
+
+      - name: Run a build in Stata
+        env:
+          code_file: ${{ fromJson(needs.initialize.outputs.SUBMITTED_CODE).file }}
+          original_file: ${{ fromJson(needs.initialize.outputs.SUBMITTED_CODE).original }}
+        run: |
+          set -o pipefail
+          set +e
+          stata <<< "do ${code_file}" 2>&1 | tee submission.log
+          rc=$?
+          ERROR_CODE=$(grep -oP -m1 '^r\(\K\d+(?=\))' "submission.log")
+          set -e
+
+          if [ $rc -ne 0 ] || [[ -n "$ERROR_CODE" ]]; then
+            message="<h1>❌ Stata Build Error</h1> Your Stata code <code>${original_file}</code> encountered an error during execution. See the logs for details.<br>"
+            echo "$message" >> $GITHUB_STEP_SUMMARY
+            echo "$message" | pandoc -f html -t plain
+            if grep -q 'command .* is unrecognized' submission.log; then
+              message="<br><b>📦 command is unrecognized:</b> your code likely requires a Stata package that is not installed by default. Review the logs, then add the package to the <code>packages-stata.txt</code> file in the root of the repository. It will then be installed automatically.<br>"
+              echo "$message" >> $GITHUB_STEP_SUMMARY
+              echo "$message" | pandoc -f html -t plain
+            fi
+          else
+            message="<h1>📗 Successful Stata Build</h1> Your Stata code <code>${original_file}</code> was successfully executed.<br>"
+            echo "$message" >> $GITHUB_STEP_SUMMARY
+            echo "$message" | pandoc -f html -t plain
+          fi
+
+          if [[ -n "$ERROR_CODE" ]]; then
+            exit $ERROR_CODE
+          else
+            exit $rc
+          fi
+        if: fromJson(needs.initialize.outputs.SUBMITTED_CODE).lang == 'stata'
+        shell: bash
+
+      - name: Run a build in Python
+        env:
+          code_file: ${{ fromJson(needs.initialize.outputs.SUBMITTED_CODE).file }}
+          original_file: ${{ fromJson(needs.initialize.outputs.SUBMITTED_CODE).original }}
+        run: |
+          set -o pipefail
+          set +e
+          python3 "${code_file}" 2>&1 | tee submission.log
+          rc=$?
+          set -e
+
+          if [ $rc -eq 0 ]; then
+            message="<h1>📗 Successful Python Build</h1> Your python code <code>${original_file}</code> was successfully executed.<br>"
+            echo "$message" >> $GITHUB_STEP_SUMMARY
+            echo "$message" | pandoc -f html -t plain
+          else
+            message="<h1>❌ Python Build Error</h1> Your python code <code>${original_file}</code> encountered an error during execution. See the logs for details.<br>"
+            echo "$message" >> $GITHUB_STEP_SUMMARY
+            echo "$message" | pandoc -f html -t plain
+            if grep -q 'ModuleNotFoundError' submission.log; then
+              message="<br><b>📦 ModuleNotFoundError:</b> your code likely requires a Python package that is not installed by default. Review the logs, then add the package to the <code>packages-python.txt</code> file in the root of the repository. It will then be installed automatically.<br>"
+              echo "$message" >> $GITHUB_STEP_SUMMARY
+              echo "$message" | pandoc -f html -t plain
+            fi
+          fi
+          exit $rc
+        if: fromJson(needs.initialize.outputs.SUBMITTED_CODE).lang == 'python'
+        shell: bash
+
+      - name: Run a build in R
+        env:
+          code_file: ${{ fromJson(needs.initialize.outputs.SUBMITTED_CODE).file }}
+          original_file: ${{ fromJson(needs.initialize.outputs.SUBMITTED_CODE).original }}
+        run: |
+          set -o pipefail
+          set +e
+          Rscript "${code_file}" 2>&1 | tee submission.log
+          rc=$?
+          set -e
+
+          if [ $rc -eq 0 ]; then
+            message="<h1>📗 Successful R Build</h1> Your R code <code>${original_file}</code> was successfully executed.<br>"
+            echo "$message" >> $GITHUB_STEP_SUMMARY
+            echo "$message" | pandoc -f html -t plain
+          else
+            message="<h1>❌ R Build Error</h1> Your R code <code>${original_file}</code> encountered an error during execution. See the logs for details.<br>"
+            echo "$message" >> $GITHUB_STEP_SUMMARY
+            echo "$message" | pandoc -f html -t plain
+            if grep -q 'there is no package called' submission.log; then
+              message="<br><b>📦 Error in library:</b> your code likely requires an R package that is not installed by default. Review the logs, then add the package to the <code>packages-r.txt</code> file in the root of the repository. It will then be installed automatically.<br>"
+              echo "$message" >> $GITHUB_STEP_SUMMARY
+              echo "$message" | pandoc -f html -t plain
+            fi
+          fi
+          exit $rc
+        if: fromJson(needs.initialize.outputs.SUBMITTED_CODE).lang == 'r'
+        shell: bash
+
+      #######################
+      # Cache results
+      #######################
+
+      - name: Store hash of results
+        id: hash
+        run: echo "LOG_HASH=$LOG_HASH" >> $GITHUB_OUTPUT
+        env:
+          LOG_HASH: ${{ hashFiles('results/**') }}
+
+      - name: Cache results
+        uses: actions/cache/save@v4
+        with:
+          path: results/
+          key: results-${{ steps.hash.outputs.LOG_HASH }}
+
+      #######################
+      # Validate results
+      #######################
+
+      - name: Validate results
+        run: |
+          print_yaml () {
+            echo '' >> $GITHUB_STEP_SUMMARY
+            echo '' >> $GITHUB_STEP_SUMMARY
+            echo '**Generated output:**' >> $GITHUB_STEP_SUMMARY
+            echo '```yaml' >> $GITHUB_STEP_SUMMARY
+            cat $1 >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+
+            echo ''
+            echo '```' "$1"
+            cat $1
+            echo '```'
+          }
+
+          pip install PyYAML==6.0.2
+
+          set +e
+          ./automation/submission_validate.py --config "automation/config.yaml" --correct '${{ secrets[steps.config.outputs.RESULTS_GHS_NAME] }}' --output "validation.log"
+          rc=$?
+          set -e
+
+          if [ $rc -eq 1 ]; then
+            message="<h1>🤷 Results Validation</h1> The code to automatically validate your results failed with an error. Review the logs, and post on the Quercus <b>Course Logistics and Assignment Details</b> discussion board if you're still having trouble.<br><br>"
+            echo "$message" >> $GITHUB_STEP_SUMMARY
+            echo "$message" | pandoc -f html -t plain
+            print_yaml "${{ steps.config.outputs.RESULTS_SUBMITTED_PATH }}"
+          else
+            cat validation.log >> $GITHUB_STEP_SUMMARY
+            pandoc -f markdown -t html validation.log | pandoc -f html -t plain
+          fi
+
+          exit $rc
+        if: steps.config.outputs.RESULTS_GHS_NAME && steps.config.outputs.RESULTS_GHS_NAME != 'null'
+
+################################################################################
+# Typeset Paper
+################################################################################
+  typeset_paper:
+    needs: run_submission
+    if: always() && needs.run_submission.outputs.PAPER_PATH != 'null' && needs.run_submission.outputs.TIMESTAMP # check TIMESTAMP to ensure a submission was found
+    runs-on: ubuntu-latest
+    timeout-minutes: 20 # Github's default timeout is 6hr, the maximum configurable timeout is 72hr
+    outputs:
+      LOG_HASH: ${{ steps.hash.outputs.LOG_HASH }}
+      PDF_PATH: ${{ steps.typeset.outputs.pdf_path }}
+
+    steps:
+      #######################
+      # Configure
+      #######################
+
+      - name: Check out code repository
+        uses: actions/checkout@v4
+
+      - name: Load cached results
+        uses: actions/cache/restore@v4
+        with:
+          path: results/
+          key: results-${{ needs.run_submission.outputs.LOG_HASH }}
+
+      - name: Install pandoc
+        run: |
+          # See latest versions here: https://github.com/jgm/pandoc/releases/
+          wget --progress=dot:mega -O pandoc.deb "https://github.com/jgm/pandoc/releases/download/3.1.13/pandoc-3.1.13-1-amd64.deb"
+          sudo dpkg --install pandoc.deb
+          rm pandoc.deb
+
+      # - name: Install Apple Color Emoji font for Linux
+      #   run: |
+      #     mkdir -p ~/.local/share/fonts
+      #     # See latest versions here: https://github.com/samuelngs/apple-emoji-linux/releases/
+      #     wget --progres=dot:giga -O ~/.local/share/fonts/AppleColorEmoji.ttf "https://github.com/samuelngs/apple-emoji-linux/releases/download/v16.4/AppleColorEmoji.ttf"
+      #     fc-cache -fv
+      #     fc-list
+
+      # - name: Install LibreOffice Calc
+      #   run: |
+      #     sudo apt-get update
+      #     sudo apt-get install -y libreoffice-calc
+      #   if: hashFiles(format('results/{0}.xlsx', inputs.paper_name)) != ''
+
+      # - name: Install Latin Modern Math font (for table typesetting)
+      #   run: |
+      #     mkdir -p ~/.local/share/fonts
+      #     cp paper/config/latinmodern-math.otf ~/.local/share/fonts
+      #     fc-cache -fv
+      #     fc-list
+      #   if: hashFiles(format('results/{0}.xlsx', inputs.paper_name)) != ''
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install Python dependencies
+        run: python -m pip install -r requirements.txt
+
+      #######################
+      # Install TeX Live
+      #######################
+
+      - name: Give default user ownership of texlive install folder
+        run: |
+          sudo mkdir -p /usr/local/texlive/
+          sudo chown runner:runner -R /usr/local/texlive/
+
+      - name: Cache texlive installation
+        id: cache-texlive
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/texlive/
+          key: install_texlive
+
+      - name: Install texlive
+        run: |
+          wget --progress=dot:mega https://mirror.ctan.org/systems/texlive/tlnet/install-tl-unx.tar.gz
+          zcat install-tl-unx.tar.gz | tar xf -
+          rm install-tl-unx.tar.gz
+          cd install-tl-*
+          perl ./install-tl --no-interaction --scheme scheme-small --paper=letter --no-doc-install --no-src-install
+        working-directory: /tmp
+        if: steps.cache-texlive.outputs.cache-hit != 'true'
+
+      - name: Add texlive to path
+        run: |
+          echo "$(find /usr/local/texlive -type d -name "x86_64-linux" | tail -1)" >> $GITHUB_PATH
+          echo "Added folder to PATH: $(find /usr/local/texlive -type d -name "x86_64-linux" | tail -1)"
+
+      - name: Add texlive dependencies
+        run: tlmgr install enumitem xifthen ifmtarg hardwrap catchfile titlesec changepage paralist biblatex placeins sauerj palatino mathpazo fpl etbb lualatex-math tex-gyre collection-luatex footmisc
+        if: steps.cache-texlive.outputs.cache-hit != 'true'
+
+      - name: Give root ownership of texlive install folder
+        run: |
+          sudo chown root:root -R /usr/local/texlive/
+          sudo chmod a+r -R /usr/local/texlive/
+
+      - name: Save texlive installation to cache
+        uses: actions/cache/save@v4
+        with:
+          path: /usr/local/texlive/
+          key: install_texlive
+        if: steps.cache-texlive.outputs.cache-hit != 'true'
+
+      #######################
+      # Typeset
+      #######################
+
+      - name: Generate placeholder figures
+        run: ./automation/placeholder_figures.py --config "automation/config.yaml"
+
+      - name: Typeset the paper
+        id: typeset
+        run: |
+          filepath="$(yq '.paper_typeset' automation/config.yaml)"
+          dir_name=$(dirname "$filepath")
+          base_name=$(basename "$filepath" .md)
+          output_path="${dir_name}/${base_name}_${{ needs.run_submission.outputs.TIMESTAMP }}.pdf"
+
+          pandoc "$filepath" paper/config/formatting.yml --citeproc --filter paper/config/pandoc_mustache.py --pdf-engine=lualatex --output "${output_path}"
+
+          message="<h1>📝 Successful PDF Creation</h1>"
+          echo "$message" >> $GITHUB_STEP_SUMMARY
+          echo "$message" | pandoc -f html -t plain
+
+          echo "PDF_PATH=${output_path}" >> $GITHUB_OUTPUT
+
+      #######################
+      # Cache paper
+      #######################
+
+      - name: Store hash of pdf file
+        id: hash
+        run: echo "LOG_HASH=$LOG_HASH" >> $GITHUB_OUTPUT
+        env:
+          LOG_HASH: ${{ hashFiles('${{ steps.typeset.outputs.PDF_PATH }}') }}
+
+      - name: Cache pdf file
+        uses: actions/cache/save@v4
+        with:
+          path: "${{ steps.typeset.outputs.PDF_PATH }}"
+          key: paper-${{ steps.hash.outputs.LOG_HASH }}
+
+
+################################################################################
+# Post Results
+################################################################################
+  post_results:
+    needs:
+      - run_submission
+      - typeset_paper
+    if: always() && needs.run_submission.outputs.TIMESTAMP # check TIMESTAMP to ensure a submission was found
+    runs-on: ubuntu-latest
+    timeout-minutes: 5 # Github's default timeout is 6hr, the maximum configurable timeout is 72hr
+
+    steps:
+      #######################
+      # Configure
+      #######################
+
+      - name: Check out code repository
+        uses: actions/checkout@v4
+
+      - name: Load cached results
+        uses: actions/cache/restore@v4
+        with:
+          path: results/
+          key: results-${{ needs.run_submission.outputs.LOG_HASH }}
+
+      - name: Load cached PDF
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ needs.typeset_paper.outputs.PDF_PATH }}
+          key: paper-${{ needs.typeset_paper.outputs.LOG_HASH }}
+        if: needs.typeset_paper.outputs.PDF_PATH
+
+      - name: Install pandoc
+        run: |
+          # See latest versions here: https://github.com/jgm/pandoc/releases/
+          wget --progress=dot:mega -O pandoc.deb "https://github.com/jgm/pandoc/releases/download/3.1.13/pandoc-3.1.13-1-amd64.deb"
+          sudo dpkg --install pandoc.deb
+          rm pandoc.deb
+
+      #######################
+      # Zip results
+      #######################
+
+      - name: Determine zip filename
+        id: results_zip
+        run: |
+          echo "filename=results_${{ needs.run_submission.outputs.TIMESTAMP }}" >> $GITHUB_OUTPUT
+          rm -f results/README.md  # Omit README.md from zip
+
+      - name: Zip results
+        run: |
+          import shutil
+          shutil.make_archive("${{ steps.results_zip.outputs.filename }}", 'zip', 'results')
+        shell: python
+
+      #######################
+      # Release
+      #######################
+
+      - uses: ncipollo/release-action@v1
+        id: release
+        with:
+          artifacts: "${{ steps.results_zip.outputs.filename }}.zip"
+          artifactErrorsFailBuild: true
+          body: "Results generated by <a href='https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id	}}'>build #${{ github.run_number }}</a>."
+          commit: ${{ github.sha }}
+          tag: "${{ steps.results_zip.outputs.filename }}"
+
+      - uses: ncipollo/release-action@v1
+        id: release_pdf
+        with:
+          allowUpdates: true
+          artifacts: "${{ steps.results_zip.outputs.filename }}.zip, ${{ needs.typeset_paper.outputs.PDF_PATH }}"
+          artifactErrorsFailBuild: true
+          body: "Results generated by <a href='https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id	}}'>build #${{ github.run_number }}</a>."
+          commit: ${{ github.sha }}
+          tag: "${{ steps.results_zip.outputs.filename }}"
+        if: needs.typeset_paper.outputs.PDF_PATH
+
+      - name: Post link to zip
+        run: |
+          release_url="${{ steps.release.outputs.html_url }}"
+
+          # Replace /tag/ with /download/
+          modified_url="${release_url/tag/download}"
+
+          # Append filename to modified_url
+          download_url="${modified_url}/${{ steps.results_zip.outputs.filename }}.zip"
+
+          message="📦 Download the zipped <a href='$download_url'>results folder</a> generated by the code."
+          echo "$message" >> $GITHUB_STEP_SUMMARY
+          echo "$message" | pandoc -f html -t plain
+          echo "$download_url"
+        shell: bash
+
+      - name: Post link to PDF
+        run: |
+          release_url="${{ steps.release.outputs.html_url }}"
+          pdf_path="${{ needs.typeset_paper.outputs.PDF_PATH }}"
+
+          # Replace /tag/ with /download/
+          modified_url="${release_url/tag/download}"
+
+          # Extract filename from pdf_path using basename command
+          pdf_filename=$(basename "$pdf_path")
+
+          # Combine modified_url and pdf_filename
+          download_url="${modified_url}/${pdf_filename}"
+
+          message="📄 Download the <a href='$download_url'>PDF file</a> generated from the results."
+          echo "$message" >> $GITHUB_STEP_SUMMARY
+          echo "$message" | pandoc -f html -t plain
+          echo "$download_url"
+        shell: bash
+        if: needs.typeset_paper.outputs.PDF_PATH
