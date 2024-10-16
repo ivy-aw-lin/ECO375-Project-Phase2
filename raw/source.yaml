@@ -1,0 +1,17 @@
+caschool.*:
+    obtained: 2024-09-13
+    source: https://q.utoronto.ca/files/33146116/download?download_frd=1
+    description: |
+        This is a copy of the California Standardized Testing and Reporting (STAR) dataset from the ECO375 Week 1 Lecture Materials.
+
+CaliforniaTestScores.pdf:
+    obtained: 2024-09-13
+    source: https://q.utoronto.ca/files/33146116/download?download_frd=1
+    description: |
+        This is a copy of the California Standardized Testing and Reporting (STAR) documentation from the ECO375 Week 1 Lecture Materials.
+
+auto.dta:
+    obtained: 2024-09-24
+    source: https://www.stata.com/manuals/dsysuse.pdf
+    description: |
+        This is a copy of the file loaded by running `sysuse auto` in Stata.
