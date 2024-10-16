@@ -1,0 +1,4 @@
+stata_version: 18
+results_submitted_path: "results/module2.yaml"
+results_correct_ghs: "RESULTS_ECO375_MODULE2"
+paper_typeset: "automation/eco375_fall2024_DAmodule2.md"
